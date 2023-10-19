@@ -1,0 +1,11 @@
+[package]
+name = "fast-metarounding"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+grb  = { version = "1.3.0"  }
+argh = { version = "0.1.10" }
+rand = { version = "0.8.5"  }

@@ -183,7 +183,8 @@ impl<'a> Metarounding for Lp<'a> {
 
 
         // Solve LP to obtain the coefficient vector `lambda`.
-        let (_, lambda) = solve_primal(&self.env, x, &self.comb_vectors);
+        let (_, lambda) = solve_primal(&self.env, x, &self.comb_vectors)
+            .unwrap();
 
         let comb_vectors = std::mem::take(&mut self.comb_vectors);
         (lambda, comb_vectors)

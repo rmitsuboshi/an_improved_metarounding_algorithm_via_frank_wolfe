@@ -14,9 +14,6 @@ pub struct Soft<'a> {
     /// Note that `L` is at most the dimension of `x`.
     l1_norm: f64,
 
-    /// An upper-bound of infiniy norm of `x`.
-    linf_norm: f64,
-
 
     /// The number of items.
     _n_items: usize,
@@ -41,21 +38,17 @@ pub struct Soft<'a> {
 
 impl<'a> Soft<'a> {
     pub fn new(
-        linf_norm: f64,
         tolerance: f64,
         oracle: &'a Oracle,
     ) -> Self
     {
-        let mut env = Env::new("").unwrap();
-        env.set(param::OutputFlag, 0).unwrap();
-        env.set(param::NumericFocus, 3).unwrap();
-        // env.set(param::DualReductions, 0).unwrap();
+        let mut env = Env::new("Soft").unwrap();
+        init_env(&mut env);
         let (_n_items, n_sets) = oracle.shape();
-        let l1_norm = n_sets as f64;
+        let l1_norm = 1f64;
 
         Self {
             l1_norm,
-            linf_norm,
             _n_items,
             n_sets,
             tolerance,
@@ -68,7 +61,8 @@ impl<'a> Soft<'a> {
     fn max_iter(&self) -> usize {
         assert!(self.tolerance > 0.0);
         let l = self.l1_norm;
-        let numer = 8.0 * l.powi(2) * self.linf_norm.powi(2);
+        let max_val = self.oracle.max_entry();
+        let numer = 8.0 * l.powi(2) * max_val.powi(2);
         let numer = numer * (l * self.n_sets as f64).ln();
         let denom = self.tolerance.powi(2);
 
@@ -80,7 +74,7 @@ impl<'a> Soft<'a> {
         &mut self,
         ghat: f64,
         x: &[f64],
-        comb_vectors: &[Vec<f64>],
+        comb_vectors: &[Concept],
         prev: &[f64],
     ) -> Result<Vec<f64>, ()>
     {
@@ -179,7 +173,7 @@ impl<'a> Soft<'a> {
         &mut self,
         ghat: f64,
         x: &[f64],
-        comb_vectors: &[Vec<f64>],
+        comb_vectors: &[Concept],
     ) -> Result<Vec<f64>, ()>
     {
         let mut prev = vec![1.0 / self.n_sets as f64; self.n_sets];
@@ -230,13 +224,15 @@ impl<'a> Soft<'a> {
 
 
         let n_sets = self.n_sets as f64;
+        let mut old_objval = f64::MAX;
         loop {
             // Set the objective function.
             let objective = vars.iter()
                 .zip(&prev)
                 .map(|(&v, &p)| {
                     assert!(p > 0.0);
-                    let log = (p * n_sets).ln();
+                    let log = (p * n_sets).ln()
+                        .clamp(-INFINITY, INFINITY);
                     let lin = (log - 1.0) * v;
                     let quad = (0.5_f64 / p).min(INFINITY) * (v * v);
                     lin + quad
@@ -267,6 +263,8 @@ impl<'a> Soft<'a> {
                 _ => {},
             }
 
+            let objval = model.get_attr(attr::ObjVal)
+                .unwrap();
 
             // Get the optimal solution 
             let next = vars.iter()
@@ -274,7 +272,7 @@ impl<'a> Soft<'a> {
                 .collect::<Vec<_>>();
             // Calculate the distance
             // from the previous solution to the current one.
-            let dist = distance(&prev, &next);
+            // let dist = distance(&prev, &next);
 
             // Update the iterate
             prev = next;
@@ -285,7 +283,9 @@ impl<'a> Soft<'a> {
             // any non-positive-valued entry.
             let has_zero = prev.iter().any(|&p| p == 0.0);
             if has_zero { return Err(()); }
-            if dist * 10.0 < self.tolerance { break; }
+            let diff = objval - old_objval;
+            if diff * 10.0 < self.tolerance { break; }
+            old_objval = objval;
             // if has_zero || dist * 10.0 < self.tolerance { break; }
         }
 
@@ -301,9 +301,7 @@ impl<'a> Metarounding for Soft<'a> {
         let x = x.as_ref();
 
         assert_eq!(x.len(), self.n_sets);
-        self.l1_norm = 1_f64;
-        // A vector of combinatorial vectors, 
-        // collected by current iteration.
+        self.l1_norm = 1f64;
         let mut comb_vectors;
         loop {
             let max_iter = self.max_iter();
@@ -339,17 +337,17 @@ impl<'a> Metarounding for Soft<'a> {
             }
 
             // Obtain a dual lp solution.
-            let (_, ell) = solve_dual(&self.env, x, &comb_vectors);
+            self.env.set(param::DualReductions, 0).unwrap();
+            let (_, ell) = solve_dual(&self.env, x, &comb_vectors)
+                .unwrap();
+            self.env.set(param::DualReductions, 1).unwrap();
             let s = ell.iter().sum::<f64>();
-            if s < self.l1_norm {
-                break;
-            } else {
-                self.l1_norm *= 2.0;
-            }
+            if s < self.l1_norm { break; } else { self.l1_norm *= 2.0; }
         }
 
         // Solve LP to obtain the coefficient vector `lambda`.
-        let (_, lambda) = solve_primal(&self.env, x, &comb_vectors);
+        let (_, lambda) = solve_primal(&self.env, x, &comb_vectors)
+            .unwrap();
 
 
         (lambda, comb_vectors)

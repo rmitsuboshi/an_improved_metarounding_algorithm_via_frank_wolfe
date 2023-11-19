@@ -14,8 +14,9 @@ pub struct SoftV2<'a> {
     /// Note that `L` is at most the dimension of `x`.
     l1_norm: f64,
 
-    /// An upper-bound of infiniy norm of `x`.
-    linf_norm: f64,
+
+    /// `m := max{ 1/x[i] | x[i] > 0 }`
+    m: f64,
 
 
     /// The number of items.
@@ -36,42 +37,109 @@ pub struct SoftV2<'a> {
 
     /// Gurobi Env
     env: Env,
+
+    model: Model,
+    vars: Vec<Var>,
 }
 
 
 impl<'a> SoftV2<'a> {
     pub fn new(
-        linf_norm: f64,
         tolerance: f64,
         oracle: &'a Oracle,
     ) -> Self
     {
         let mut env = Env::new("").unwrap();
-        env.set(param::OutputFlag, 0).unwrap();
-        env.set(param::NumericFocus, 3).unwrap();
+        init_env(&mut env);
         let (_n_items, n_sets) = oracle.shape();
         let l1_norm = n_sets as f64;
 
+        let model = Model::with_env("SoftV2", &env)
+            .expect("Failed to construct a new gurobi model");
+        let vars = Vec::new();
+
         Self {
+            m: 1.0,
             l1_norm,
-            linf_norm,
             _n_items,
             n_sets,
             tolerance,
             oracle,
             env,
+            model,
+            vars,
         }
     }
 
 
-    fn max_iter(&self) -> usize {
+    fn max_iter(&self, _x: &[f64]) -> usize {
         assert!(self.tolerance > 0.0);
-        let l = self.l1_norm;
-        let numer = 8.0 * l.powi(2) * self.linf_norm.powi(2);
-        let numer = numer * (l * self.n_sets as f64).ln();
+        let max_val = self.oracle.max_entry();
+        let n = self.n_sets as f64;
+        let numer = 8.0 * (max_val * self.m * n).powi(2);
+        let numer = numer * (self.m * n.powi(2)).ln();
         let denom = self.tolerance.powi(2);
 
         ((numer / denom) + 2.0).floor() as usize
+    }
+
+
+    /// Construct a new QP instance.
+    fn build_qp(
+        &mut self,
+        model_name: &str,
+        x: &[f64]
+    ) -> grb::Result<()>
+    {
+        let mut model = Model::with_env(model_name, &self.env)?;
+        assert_eq!(x.len(), self.n_sets);
+        self.vars = (0..self.n_sets).map(|i| {
+            let name = format!("ell[{i}]");
+            add_ctsvar!(model, name: &name, bounds: 0.0..self.m)
+        })
+        .collect::<grb::Result<Vec<_>>>()?;
+        self.model = model;
+        self.model.update()?;
+
+        let lx = self.vars.iter()
+            .zip(x)
+            .map(|(&vi, &xi)| vi * xi)
+            .grb_sum();
+        let name = "sum( ell[i] * x[i] ) <= 1";
+        self.model.add_constr(&name, c!(lx <= 1f64))?;
+
+        let sum = self.vars.iter().grb_sum();
+        let name = "sum( ell[..] ) <= L";
+        self.model.add_constr(&name, c!(sum <= self.l1_norm))?;
+        self.model.update()?;
+
+        Ok(())
+    }
+
+
+
+    fn grb_objective(&self, prev: &[f64]) -> Expr {
+        let n_sets = self.vars.len() as f64;
+        self.vars.iter()
+            .zip(prev)
+            .filter_map(|(&v, &p)| {
+                if p == 0.0 {
+                    None
+                } else {
+                assert!(p > 0.0);
+                    let log = (p * n_sets).ln();
+                    let lin = (log - 1.0).clamp(-INFINITY, INFINITY) * v;
+                    let quad = (0.5_f64 / p).clamp(0.0, INFINITY)
+                        * (v * v);
+                    Some(lin + quad)
+                }
+                // assert!(p > 0.0);
+                // let log = (p * n_sets).ln();
+                // let lin = (log - 1.0) * v;
+                // let quad = (0.5_f64 / p) * (v * v);
+                // lin + quad
+            })
+            .grb_sum()
     }
 
 
@@ -85,33 +153,8 @@ impl<'a> SoftV2<'a> {
     {
         self.env.set(param::DualReductions, 0).unwrap();
         // Construct a new model to refresh the constraints.
-        let mut model = Model::with_env("MBB (w/o reduction)", &self.env)
-            .unwrap();
-
-        // Defines variable `ell`
-        let vars = (0..self.n_sets).map(|i| {
-            let name = format!("ell[{i}]");
-            add_ctsvar!(model, name: &name, bounds: 0.0..).unwrap()
-        })
-        .collect::<Vec<_>>();
-        model.update().unwrap();
-
-
-        // Add the constraint `l * x <= 1`.
-        let lx = vars.iter()
-            .zip(x)
-            .map(|(&li, &xi)| xi * li)
-            .grb_sum();
-        let name = "ell * x <= 1";
-        model.add_constr(&name, c!(lx <= 1_f64)).unwrap();
-        model.update().unwrap();
-
-
-        // Add the constraint `l * 1 <= L`
-        let lhs = vars.iter().grb_sum();
-        let name = "ell * 1 <= L";
-        model.add_constr(&name, c!(lhs <= self.l1_norm)).unwrap();
-        model.update().unwrap();
+        self.build_qp("MBB (w/o reduction)", x)
+            .expect("Failed to construct a model");
 
 
         // Add constraints `c * l >= g_hat` for all `c`
@@ -121,37 +164,28 @@ impl<'a> SoftV2<'a> {
             .enumerate()
             .for_each(|(k, c)| {
                 let lhs = c.iter()
-                    .zip(&vars)
+                    .zip(&self.vars)
                     .map(|(&ci, &li)| ci * li)
                     .grb_sum();
                 let name = format!("C[{k}]");
-                model.add_constr(&name, c!(lhs >= rhs)).unwrap();
+                self.model.add_constr(&name, c!(lhs >= rhs)).unwrap();
             });
-        model.update().unwrap();
+        self.model.update().unwrap();
 
 
-        let n_sets = self.n_sets as f64;
-        let objective = vars.iter()
-            .zip(&prev)
-            .map(|(&v, &p)| {
-                assert!(p > 0.0);
-                let log = (p * n_sets).ln();
-                let lin = (log - 1.0) * v;
-                let quad = (0.5_f64 / p) * (v * v);
-                lin + quad
-            })
-            .grb_sum();
-        model.set_objective(objective, Minimize).unwrap();
-        model.update().unwrap();
+        assert_eq!(self.n_sets, self.vars.len());
+        let objective = self.grb_objective(&prev);
+        self.model.set_objective(objective, Minimize).unwrap();
+        self.model.update().unwrap();
 
 
         // --------------------------------------
         // Solve the problem and obtain the optimal solution.
-        model.optimize().unwrap();
+        self.model.optimize().unwrap();
 
         self.env.set(param::DualReductions, 1).unwrap();
 
-        let status = model.status().unwrap();
+        let status = self.model.status().unwrap();
         match status {
             // Infeasible implies an ε-optimality.
             Status::Infeasible => { return Err(()); },
@@ -167,8 +201,8 @@ impl<'a> SoftV2<'a> {
 
 
         // Get the optimal solution 
-        let next = vars.iter()
-            .map(|v| model.get_obj_attr(attr::X, v).unwrap())
+        let next = self.vars.iter()
+            .map(|v| self.model.get_obj_attr(attr::X, v).unwrap())
             .collect::<Vec<_>>();
 
         Ok(next)
@@ -184,38 +218,8 @@ impl<'a> SoftV2<'a> {
     {
         let mut prev = vec![1.0 / self.n_sets as f64; self.n_sets];
         // Construct a new model to refresh the constraints.
-        let mut model = Model::with_env("MBB", &self.env)
-            .unwrap();
-
-
-        let ub = x.iter()
-            .filter_map(|&xi| if xi < THRESHOLD { None } else { Some(1.0 / xi) })
-            .reduce(f64::max)
-            .expect("The input vector should have a non-zery entry");
-        // Defines variable `ell`
-        let vars = (0..self.n_sets).map(|i| {
-            let name = format!("ell[{i}]");
-            add_ctsvar!(model, name: &name, bounds: 0.0..ub).unwrap()
-        })
-        .collect::<Vec<_>>();
-        model.update().unwrap();
-
-
-        // Add the constraint `l * x <= 1`.
-        let lx = vars.iter()
-            .zip(x)
-            .map(|(&li, &xi)| xi * li)
-            .grb_sum();
-        let name = "ell * x <= 1";
-        model.add_constr(&name, c!(lx <= 1_f64)).unwrap();
-        model.update().unwrap();
-
-
-        // Add the constraint `l * 1 <= L`
-        let lhs = vars.iter().grb_sum();
-        let name = "ell * 1 <= L";
-        model.add_constr(&name, c!(lhs <= self.l1_norm)).unwrap();
-        model.update().unwrap();
+        self.build_qp("MbB", x)
+            .expect("Failed to construct a model");
 
 
         // Add constraints `c * l >= g_hat` for all `c`
@@ -225,48 +229,29 @@ impl<'a> SoftV2<'a> {
             .enumerate()
             .for_each(|(k, c)| {
                 let lhs = c.iter()
-                    .zip(&vars)
+                    .zip(&self.vars)
                     .map(|(&ci, &li)| ci * li)
                     .grb_sum();
                 let name = format!("C[{k}]");
-                model.add_constr(&name, c!(lhs >= rhs)).unwrap();
+                self.model.add_constr(&name, c!(lhs >= rhs)).unwrap();
             });
-        model.update().unwrap();
+        self.model.update().unwrap();
 
 
-        let n_sets = self.n_sets as f64;
         // const STABILIZER: f64 = 1e-6;
+        let mut prev_objval = f64::MAX;
         loop {
-            // Set the objective function.
-            let objective = vars.iter()
-                .zip(&prev)
-                .map(|(&v, &p)| {
-                    assert!(p > 0.0);
-                    let log = (p * n_sets).ln();
-                    let lin = (log - 1.0) * v;
-                    let quad = (0.5_f64 / p) * (v * v);
-                    lin + quad
-                })
-                .grb_sum();
-            // let objective = vars.iter()
-            //     .zip(&prev)
-            //     .map(|(&v, &p)| {
-            //         let log = ((p + STABILIZER) * n_sets).ln();
-            //         let lin = (log - 1.0) * v;
-            //         let quad = ((0.5_f64 + STABILIZER) / (p + STABILIZER)) * (v * v);
-            //         lin + quad
-            //     })
-            //     .grb_sum();
-            model.set_objective(objective, Minimize).unwrap();
-            model.update().unwrap();
+            let objective = self.grb_objective(&prev);
+            self.model.set_objective(objective, Minimize).unwrap();
+            self.model.update().unwrap();
 
 
             // --------------------------------------
             // Solve the problem and obtain the optimal solution.
-            model.optimize().unwrap();
+            self.model.optimize().unwrap();
 
 
-            let status = model.status().unwrap();
+            let status = self.model.status().unwrap();
             match status {
                 // Infeasible implies an ε-optimality.
                 Status::Infeasible => { return Err(()); },
@@ -278,32 +263,27 @@ impl<'a> SoftV2<'a> {
                 Status::Numeric => {
                     // println!("Break by status {status:?}");
                     break;
+                    // return Err(());
                 },
                 _ => {},
             }
             self.env.set(param::DualReductions, 1).unwrap();
+            let objval = self.model.get_attr(attr::ObjVal)
+                .unwrap();
 
 
             // Get the optimal solution 
-            let next = vars.iter()
-                .map(|v| model.get_obj_attr(attr::X, v).unwrap())
+            let next = self.vars.iter()
+                .map(|v| self.model.get_obj_attr(attr::X, v).unwrap())
                 .collect::<Vec<_>>();
-            // Calculate the distance
-            // from the previous solution to the current one.
-            let dist = distance(&prev, &next);
-
-            // Update the iterate
+            let has_non_pos = next.iter().any(|&nxt| nxt <= 0.0);
             prev = next;
-
-
-            // If there exists a zero-valued entry,
-            // the optimization cannot proceed for the next iteration.
-            // The following line checks whether there exists 
-            // any non-positive-valued entry.
-
-            // if dist * 10.0 < self.tolerance { break; }
-            let has_zero = prev.iter().any(|&p| p == 0.0);
-            if has_zero || dist * 10.0 < self.tolerance { break; }
+            if has_non_pos
+                || (prev_objval - objval) * 10.0 < self.tolerance
+            {
+                break;
+            }
+            prev_objval = objval;
         }
 
         Ok(prev)
@@ -318,22 +298,22 @@ impl<'a> Metarounding for SoftV2<'a> {
         let x = x.as_ref();
 
         assert_eq!(x.len(), self.n_sets);
-        self.l1_norm = x.iter()
-            .filter_map(|xi| if *xi == 0.0 { None } else { Some(1.0 / *xi) })
+        self.m = x.iter().copied()
+            .filter_map(|x| if x > 0.0 { Some(1.0/x) } else { None })
             .reduce(f64::max)
-            .expect("The input vector should have a non-zero entry")
-            * self.n_sets as f64;
+            .expect("The input vector `x` should have non-zero entry");
+        self.l1_norm = self.m * self.n_sets as f64;
         // A vector of combinatorial vectors, 
         // collected by current iteration.
         let mut comb_vectors = Vec::new();
 
 
-            // Initial estimation is the uniform distribution.
+        // Initial estimation is the uniform distribution.
         let mut ell = vec![1.0 / self.n_sets as f64; self.n_sets];
         let mut ghat = f64::MIN;
 
 
-        let max_iter = self.max_iter();
+        let max_iter = self.max_iter(x);
 
 
 
@@ -362,7 +342,8 @@ impl<'a> Metarounding for SoftV2<'a> {
         }
 
         // Solve LP to obtain the coefficient vector `lambda`.
-        let (_, lambda) = solve_primal(&self.env, x, &comb_vectors);
+        let (_, lambda) = solve_primal(&self.env, x, &comb_vectors)
+            .unwrap();
 
 
         (lambda, comb_vectors)

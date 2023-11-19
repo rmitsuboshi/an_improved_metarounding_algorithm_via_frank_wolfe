@@ -1,8 +1,11 @@
 use std::time::Instant;
+use std::fs::File;
+use std::io::prelude::*;
 
 use rand::prelude::*;
 use rand::distributions::{Distribution, Uniform};
 
+use crate::dispatch::*;
 use crate::common::*;
 use crate::metarounding::Metarounding;
 use crate::approx_algorithm::Oracle;
@@ -11,29 +14,32 @@ use crate::approx_algorithm::Oracle;
 /// Performs Online Combinatorial Linear Optimization
 /// by Online Gradient Descent + Metarounding.
 pub fn perform_oco<M>(
-    seed_loss: u64,
-    seed_choose: u64,
+    args: &Args,
     n_rounds: usize,
     oracle: &Oracle,
     mut metarounder: M,
-) -> (Vec<String>, Vec<f64>)
+)
     where M: Metarounding
 {
-    let mut rng = StdRng::seed_from_u64(seed_choose);
+    let mut file = File::create(args.output_name())
+        .expect("Failed to create file");
+    file.write_all(HEADER.as_bytes())
+        .expect("Failed to write header");
+
+
+    let mut rng = StdRng::seed_from_u64(args.algo_seed);
     let uniform = Uniform::from(0.0..1.0);
 
     let (_, n_sets) = oracle.shape();
 
-    // ********************************************
-    // Get the loss vector defined before the game.
-    let losses = build_losses(n_sets, n_rounds, seed_loss);
+    let seed = args.loss_seed;
+    let (loss_sum, loss_iter) = build_losses(n_sets, n_rounds, seed);
 
 
     // ***********************************
     // Initial prediction over `relax(C)`.
     let mut x = vec![1.0; n_sets];
     let mut prediction = x.clone();
-    let mut mean = x.clone();
 
 
     // ******************************************
@@ -42,27 +48,13 @@ pub fn perform_oco<M>(
     let diam = (n_sets as f64).sqrt();
 
 
-    let mut lines = Vec::with_capacity(n_rounds);
-    let mut cumulative_vec = vec![0.0; n_sets];
-
-    let mut loss_sum = vec![0.0; n_sets];
-    for loss in &losses {
-        loss_sum.iter_mut()
-            .zip(loss)
-            .for_each(|(a, &b)| { *a += b; });
-    }
     let best = oracle.best_action_hindsight(&loss_sum);
     let mut play_loss_sum = 0.0;
-    let mut mean_loss_sum = 0.0;
     let mut best_loss_sum = 0.0;
-    // let best_loss_sum = best.iter()
-    //     .zip(loss_sum)
-    //     .map(|(&a, b)| a * b)
-    //     .sum::<f64>();
 
     println!("---------- OCO STARTS ----------");
-    println!("{: >4}\t{: >6}\t{: >6}\t{: >6}", "ROUND", "PLAY", "MEAN", "BEST");
-    for (round, loss) in (1..=n_rounds).zip(losses) {
+    println!("{: >5}\t{: >6}\t{: >6}", "ROUND", "PLAY", "BEST");
+    for (round, loss) in (1..=n_rounds).zip(loss_iter) {
         let now = Instant::now();
         // // **********************************
         // // Get a prediction via Metarounding.
@@ -75,43 +67,14 @@ pub fn perform_oco<M>(
 
         // *****************************************
         // Update the cumulative loss vector & value
-        cumulative_vec.iter_mut()
-            .zip(&loss)
-            .for_each(|(cl, &l)| { *cl += l; });
 
-        let loss_val = loss.iter()
-            .zip(&prediction)
-            .map(|(&l, &c)| l * c)
-            .sum::<f64>();
+        let loss_val = iproduct(&loss, &prediction);
         play_loss_sum += loss_val;
 
 
-        // let mut mean = vec![0.0; n_sets];
-        // for (&d, comb) in dist.iter().zip(&combs) {
-        //     assert_eq!(mean.len(), comb.len());
-        //     mean.iter_mut()
-        //         .zip(comb)
-        //         .for_each(|(mi, ci)| { *mi += d * ci; });
-        // }
-        let mean_loss_val = loss.iter().copied()
-            .zip(mean)
-            .map(|(l, m)| l * m)
-            .sum::<f64>();
-        mean_loss_sum += mean_loss_val;
-
-
-        let best_loss_val = best.iter()
-            .zip(&loss)
-            .map(|(&ci, &li)| ci * li)
-            .sum::<f64>();
+        let best_loss_val = iproduct(&best, &loss);
         best_loss_sum += best_loss_val;
-        println!(
-            "{r: >4}\t{l: >6.2}\t{m: >6.2}\t{b: >6.2}",
-            r = round,
-            l = loss_val,
-            m = mean_loss_val,
-            b = best_loss_val,
-        );
+        println!("{round: >5}\t{loss_val: >6.2}\t{best_loss_val: >6.2}");
 
 
         // **********************
@@ -142,26 +105,17 @@ pub fn perform_oco<M>(
         let r = uniform.sample(&mut rng);
         let ix = choose(&dist, r);
         prediction = combs[ix].clone();
-        mean = vec![0.0; n_sets];
-        for (&d, comb) in dist.iter().zip(&combs) {
-            assert_eq!(mean.len(), comb.len());
-            mean.iter_mut()
-                .zip(comb)
-                .for_each(|(mi, ci)| { *mi += d * ci; });
-        }
 
         assert!(x.iter().all(|xi| (0.0..=1.0).contains(xi)));
 
 
         let time = now.elapsed().as_millis();
-        lines.push(
-            format!("{time},{loss_val},{mean_loss_val},{best_loss_val}\n")
-        );
+        let line = format!("{time},{loss_val},{best_loss_val}\n");
+        file.write_all(line.as_bytes())
+            .expect("Failed to write log");
     }
     println!("---------- OCO FINISH ----------\n");
     println!("\t* [PLAY] {play_loss_sum: >10.2}");
-    println!("\t* [MEAN] {mean_loss_sum: >10.2}");
     println!("\t* [BEST] {best_loss_sum: >10.2}");
-    (lines, cumulative_vec)
 }
 

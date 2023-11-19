@@ -58,6 +58,16 @@ impl Oracle {
     }
 
 
+    /// Returns the maximal value of combinatorial vector.
+    /// ```txt
+    ///     max{ ‖c‖_{∞} | c ∈ C }
+    /// ```
+    #[inline(always)]
+    pub fn max_entry(&self) -> f64 {
+        1.0
+    }
+
+
     #[inline(always)]
     pub fn best_action_hindsight<T>(&self, cumulative_loss: T)
         -> Vec<f64>
